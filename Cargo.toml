@@ -1,0 +1,47 @@
+[package]
+name = "valsb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A modern CLI for managing sing-box"
+license = "MIT"
+
+[[bin]]
+name = "valsb"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+dirs = "6"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+console = "0.16"
+indicatif = "0.17"
+crossterm = "0.29.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1

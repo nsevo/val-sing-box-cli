@@ -1,0 +1,10 @@
+/target
+/docs
+/artifacts
+/valsb-v*/
+
+# Docusaurus
+website/node_modules
+website/build
+website/.docusaurus
+website/.cache-loader
