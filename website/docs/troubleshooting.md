@@ -71,15 +71,13 @@ valsb start
    valsb sub update
    ```
 
-### TUN mode requires root
+### Root privileges
 
-On Linux, TUN mode requires running as root:
-
-```bash
-sudo valsb start
-```
-
-On Windows, run PowerShell as Administrator.
+`valsb` is a root-only tool. When you invoke it as a regular user it
+auto-elevates by re-launching itself under `sudo` (Linux/macOS) or with a
+UAC prompt (Windows), so you normally do not need to type `sudo` yourself.
+If you want to skip the prompt, just run from a root shell or pre-authorize
+sudo with `sudo -v`.
 
 ## Getting Help
 

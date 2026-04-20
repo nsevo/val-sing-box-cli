@@ -11,13 +11,13 @@ use crate::errors::AppResult;
 use crate::platform::ServiceBackend;
 
 #[cfg(target_os = "macos")]
-pub use self::launchd::{LaunchdAgentManager, LaunchdDaemonManager};
+pub use self::launchd::LaunchdDaemonManager;
 #[cfg(target_os = "linux")]
 pub use self::procd::ProcdManager;
 #[cfg(target_os = "linux")]
-pub use self::systemd::{SystemdSystemManager, SystemdUserManager, configure_system_delegate};
+pub use self::systemd::SystemdManager;
 #[cfg(windows)]
-pub use self::windows_svc::{WindowsServiceManager, configure_service_delegate};
+pub use self::windows_svc::WindowsServiceManager;
 
 pub trait ServiceManager {
     fn install(&self) -> AppResult<()>;
@@ -49,14 +49,7 @@ pub fn create_manager(
 ) -> Box<dyn ServiceManager> {
     match backend {
         #[cfg(target_os = "linux")]
-        ServiceBackend::SystemdUser => Box::new(SystemdUserManager::new(
-            unit_file,
-            config_path,
-            sing_box_bin,
-            data_dir,
-        )),
-        #[cfg(target_os = "linux")]
-        ServiceBackend::SystemdSystem => Box::new(SystemdSystemManager::new(
+        ServiceBackend::Systemd => Box::new(SystemdManager::new(
             unit_file,
             config_path,
             sing_box_bin,
@@ -70,14 +63,7 @@ pub fn create_manager(
             data_dir,
         )),
         #[cfg(target_os = "macos")]
-        ServiceBackend::LaunchdAgent => Box::new(LaunchdAgentManager::new(
-            unit_file,
-            config_path,
-            sing_box_bin,
-            data_dir,
-        )),
-        #[cfg(target_os = "macos")]
-        ServiceBackend::LaunchdDaemon => Box::new(LaunchdDaemonManager::new(
+        ServiceBackend::Launchd => Box::new(LaunchdDaemonManager::new(
             unit_file,
             config_path,
             sing_box_bin,

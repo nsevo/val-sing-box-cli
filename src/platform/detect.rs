@@ -19,11 +19,9 @@ pub enum Arch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceBackend {
-    SystemdUser,
-    SystemdSystem,
+    Systemd,
     Procd,
-    LaunchdAgent,
-    LaunchdDaemon,
+    Launchd,
     WindowsService,
 }
 
@@ -43,7 +41,7 @@ impl Platform {
         let arch = detect_arch()?;
         let (uid, is_root) = detect_uid_and_root();
         let username = detect_username();
-        let available_backends = detect_backends(os_family, is_root);
+        let available_backends = detect_backends(os_family);
 
         Ok(Self {
             os_family,
@@ -55,56 +53,19 @@ impl Platform {
         })
     }
 
-    pub fn default_backend(&self, tun_mode: bool) -> Option<ServiceBackend> {
-        match self.os_family {
-            OsFamily::OpenWrt => {
-                if self.available_backends.contains(&ServiceBackend::Procd) {
-                    Some(ServiceBackend::Procd)
-                } else {
-                    None
-                }
-            }
-            OsFamily::Linux => {
-                if tun_mode {
-                    if self
-                        .available_backends
-                        .contains(&ServiceBackend::SystemdSystem)
-                    {
-                        Some(ServiceBackend::SystemdSystem)
-                    } else {
-                        None
-                    }
-                } else if self
-                    .available_backends
-                    .contains(&ServiceBackend::SystemdUser)
-                {
-                    Some(ServiceBackend::SystemdUser)
-                } else if self
-                    .available_backends
-                    .contains(&ServiceBackend::SystemdSystem)
-                {
-                    Some(ServiceBackend::SystemdSystem)
-                } else {
-                    None
-                }
-            }
-            OsFamily::MacOS => {
-                if self.is_root {
-                    Some(ServiceBackend::LaunchdDaemon)
-                } else {
-                    Some(ServiceBackend::LaunchdAgent)
-                }
-            }
-            OsFamily::Windows => {
-                if self
-                    .available_backends
-                    .contains(&ServiceBackend::WindowsService)
-                {
-                    Some(ServiceBackend::WindowsService)
-                } else {
-                    None
-                }
-            }
+    /// Pick the canonical service backend for this OS, or `None` if the host
+    /// is missing the expected init system.
+    pub fn default_backend(&self) -> Option<ServiceBackend> {
+        let want = match self.os_family {
+            OsFamily::Linux => ServiceBackend::Systemd,
+            OsFamily::OpenWrt => ServiceBackend::Procd,
+            OsFamily::MacOS => ServiceBackend::Launchd,
+            OsFamily::Windows => ServiceBackend::WindowsService,
+        };
+        if self.available_backends.contains(&want) {
+            Some(want)
+        } else {
+            None
         }
     }
 
@@ -161,7 +122,22 @@ fn detect_uid_and_root() -> (u32, bool) {
 
 #[cfg(windows)]
 fn detect_uid_and_root() -> (u32, bool) {
-    (0, false)
+    (0, windows_is_elevated())
+}
+
+#[cfg(windows)]
+fn windows_is_elevated() -> bool {
+    Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "if (([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn detect_username() -> String {
@@ -175,9 +151,8 @@ fn detect_username() -> String {
     }
 }
 
-fn detect_backends(os_family: OsFamily, _is_root: bool) -> Vec<ServiceBackend> {
+fn detect_backends(os_family: OsFamily) -> Vec<ServiceBackend> {
     let mut backends = Vec::new();
-
     match os_family {
         OsFamily::OpenWrt => {
             if which_cmd("procd").is_some() || std::path::Path::new("/sbin/procd").exists() {
@@ -186,21 +161,12 @@ fn detect_backends(os_family: OsFamily, _is_root: bool) -> Vec<ServiceBackend> {
         }
         OsFamily::Linux => {
             if systemctl_available() {
-                backends.push(ServiceBackend::SystemdSystem);
-                if has_user_session() {
-                    backends.push(ServiceBackend::SystemdUser);
-                }
+                backends.push(ServiceBackend::Systemd);
             }
         }
-        OsFamily::MacOS => {
-            backends.push(ServiceBackend::LaunchdAgent);
-            backends.push(ServiceBackend::LaunchdDaemon);
-        }
-        OsFamily::Windows => {
-            backends.push(ServiceBackend::WindowsService);
-        }
+        OsFamily::MacOS => backends.push(ServiceBackend::Launchd),
+        OsFamily::Windows => backends.push(ServiceBackend::WindowsService),
     }
-
     backends
 }
 
@@ -209,10 +175,6 @@ fn systemctl_available() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
-}
-
-fn has_user_session() -> bool {
-    std::env::var("XDG_RUNTIME_DIR").is_ok()
 }
 
 fn which_cmd(name: &str) -> Option<String> {

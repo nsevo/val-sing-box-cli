@@ -1,6 +1,5 @@
 use chrono::Utc;
 use serde_json::json;
-use std::io::IsTerminal;
 #[cfg(windows)]
 use std::process::Command;
 
@@ -8,9 +7,9 @@ use crate::cli::{Commands, ConfigCommands, NodeCommands, SubCommands};
 use crate::config;
 use crate::doctor::DoctorReport;
 use crate::errors::{AppError, AppResult};
-use crate::install::{self, DelegatedControl, InstallScope, Manifest};
+use crate::install::{self, Manifest};
 use crate::output::{JsonOutput, Renderer};
-use crate::platform::{AppPaths, OsFamily, Platform};
+use crate::platform::{AppPaths, Platform};
 use crate::state::{self, AppState, Profile, RemarkSource, UpdateStatus};
 use crate::subscription;
 use crate::ui;
@@ -23,8 +22,6 @@ pub struct App {
     pub renderer: Renderer,
     pub yes: bool,
     pub config_dir_override: Option<String>,
-    pub system_install: bool,
-    pub delegated_control: Option<DelegatedControl>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -60,22 +57,7 @@ impl App {
         }
 
         let platform = Platform::detect().map_err(AppError::env)?;
-        let detected_system_install =
-            config_dir.is_none() && system_manifest_exists(platform.os_family);
-        let paths = if detected_system_install && !matches!(platform.os_family, OsFamily::Windows) {
-            AppPaths::resolve(platform.os_family, true, None)
-        } else {
-            AppPaths::resolve(platform.os_family, platform.is_root, config_dir)
-        };
-        let manifest = install::load_manifest(&paths.manifest_file())?;
-        let system_install = if detected_system_install {
-            true
-        } else {
-            manifest
-                .as_ref()
-                .map(|m| matches!(m.install_scope, InstallScope::System))
-                .unwrap_or(false)
-        };
+        let paths = AppPaths::resolve(platform.os_family, config_dir);
         let renderer = Renderer::new(json);
 
         Ok(Self {
@@ -84,80 +66,11 @@ impl App {
             renderer,
             yes,
             config_dir_override: config_dir.map(str::to_string),
-            system_install,
-            delegated_control: manifest.and_then(|m| m.delegated_control),
         })
     }
 
-    fn current_install_scope(&self) -> InstallScope {
-        match self.platform.os_family {
-            OsFamily::Windows | OsFamily::OpenWrt => InstallScope::System,
-            OsFamily::Linux | OsFamily::MacOS => {
-                if self.platform.is_root || self.system_install {
-                    InstallScope::System
-                } else {
-                    InstallScope::User
-                }
-            }
-        }
-    }
-
-    fn has_delegated_control(&self) -> bool {
-        self.delegated_control.is_some()
-    }
-
-    fn configure_control_plane_access(&self) -> AppResult<Option<DelegatedControl>> {
-        if !matches!(self.current_install_scope(), InstallScope::System) {
-            return Ok(None);
-        }
-
-        match self.platform.os_family {
-            OsFamily::Linux => {
-                #[cfg(target_os = "linux")]
-                {
-                    if self.paths.unit_file
-                        == std::path::Path::new("/etc/systemd/system/valsb-sing-box.service")
-                    {
-                        if let Some(delegate_user) = detect_unix_delegate_user(&self.platform) {
-                            crate::service::configure_system_delegate(&self.paths, &delegate_user)
-                                .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    } else {
-                        Ok(None)
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Ok(None)
-                }
-            }
-            OsFamily::Windows => {
-                #[cfg(windows)]
-                {
-                    crate::service::configure_service_delegate().map(Some)
-                }
-                #[cfg(not(windows))]
-                {
-                    Ok(None)
-                }
-            }
-            OsFamily::OpenWrt | OsFamily::MacOS => Ok(None),
-        }
-    }
-
-    fn build_manifest(
-        &self,
-        sing_box_version: Option<String>,
-        delegated_control: Option<DelegatedControl>,
-    ) -> Manifest {
-        Manifest::new(
-            &self.paths,
-            sing_box_version,
-            self.current_install_scope(),
-            delegated_control.or_else(|| self.delegated_control.clone()),
-        )
+    fn build_manifest(&self, sing_box_version: Option<String>) -> Manifest {
+        Manifest::new(&self.paths, sing_box_version)
     }
 
     fn load_state(&self) -> AppResult<AppState> {
@@ -205,15 +118,12 @@ impl App {
     }
 
     fn get_service_manager(&self) -> AppResult<Box<dyn crate::service::ServiceManager>> {
-        let backend = self
-            .platform
-            .default_backend(matches!(self.current_install_scope(), InstallScope::System))
-            .ok_or_else(|| {
-                AppError::env_with_hint(
-                    "no supported service backend available",
-                    "run `valsb doctor` to check your environment",
-                )
-            })?;
+        let backend = self.platform.default_backend().ok_or_else(|| {
+            AppError::env_with_hint(
+                "no supported service backend available",
+                "run `valsb doctor` to check your environment",
+            )
+        })?;
 
         let config_path = self.paths.generated_config_file();
         let data_dir_str = self.paths.data_dir.to_string_lossy().into_owned();
@@ -315,99 +225,37 @@ impl App {
         }
     }
 
-    #[cfg(not(windows))]
-    pub fn maybe_elevate_unix_command(&self, command: &Commands) -> AppResult<()> {
+    /// Re-execute the current command as root if needed.
+    ///
+    /// valsb is a root-only tool. Any state lives under system paths
+    /// (`/etc`, `/var/lib`, `/var/cache`) or `%PROGRAMDATA%`, and the
+    /// service runs as root because TUN mode requires it. When a regular
+    /// user invokes a command that touches state or the service we just
+    /// re-exec ourselves under sudo / UAC and propagate the exit code.
+    ///
+    /// Pure-local commands (`version`, `completion`, the Windows service
+    /// worker entry point) skip elevation. Passing `--config-dir <path>`
+    /// also bypasses elevation so tests and scratch installs can run as a
+    /// regular user.
+    pub fn maybe_elevate(&self, command: &Commands) -> AppResult<()> {
         if self.config_dir_override.is_some()
             || self.platform.is_root
-            || !self.system_install
-            || should_defer_elevation_until_confirmation(command, self.yes)
-            || !unix_command_needs_admin(command, self.has_delegated_control())
+            || !command_requires_root(command)
         {
             return Ok(());
         }
 
-        let (headline, reasons) = unix_elevation_reasons(command);
-        eprintln!("  {}", console::style(headline).dim());
-        eprintln!("  Root privileges are required for this command because:");
-        for reason in reasons {
-            eprintln!("    - {reason}");
-        }
-        eprintln!();
-
-        if !self.yes {
-            if !std::io::stdin().is_terminal() {
-                return Err(AppError::env_with_hint(
-                    "system-wide installation requires confirmation before sudo",
-                    "re-run interactively or use: sudo valsb <command>",
-                ));
-            }
-
-            let confirmed = dialoguer::Confirm::with_theme(&ui::select_theme())
-                .with_prompt("Continue and request sudo?")
-                .default(true)
-                .interact()
-                .map_err(|e| AppError::runtime(format!("failed to read confirmation: {e}")))?;
-            if !confirmed {
-                return Err(AppError::user_with_hint(
-                    "sudo request cancelled",
-                    "re-run with: sudo valsb <command>",
-                ));
-            }
-        }
-
-        eprintln!("  {}", console::style("Requesting sudo...").dim());
-        relaunch_current_command_with_sudo()?;
-        std::process::exit(0);
-    }
-
-    #[cfg(windows)]
-    pub fn maybe_elevate_windows_command(&self, command: &Commands) -> AppResult<()> {
-        if self.config_dir_override.is_some()
-            || should_defer_elevation_until_confirmation(command, self.yes)
-            || !windows_command_needs_admin(command, self.has_delegated_control())
+        #[cfg(not(windows))]
         {
-            return Ok(());
+            relaunch_with_sudo()?;
+            std::process::exit(0);
         }
 
-        if windows_is_elevated()? {
-            return Ok(());
+        #[cfg(windows)]
+        {
+            relaunch_as_admin()?;
+            std::process::exit(0);
         }
-
-        let (headline, reasons) = windows_elevation_reasons(command);
-        eprintln!("  {}", console::style(headline).dim());
-        eprintln!("  Administrator privileges are required for this command because:");
-        for reason in reasons {
-            eprintln!("    - {reason}");
-        }
-        eprintln!();
-
-        if !self.yes {
-            if !std::io::stdin().is_terminal() {
-                return Err(AppError::env_with_hint(
-                    "windows service command requires confirmation before elevation",
-                    "re-run interactively or launch PowerShell as Administrator",
-                ));
-            }
-
-            let confirmed = dialoguer::Confirm::with_theme(&ui::select_theme())
-                .with_prompt("Continue and request Administrator privileges?")
-                .default(true)
-                .interact()
-                .map_err(|e| AppError::runtime(format!("failed to read confirmation: {e}")))?;
-            if !confirmed {
-                return Err(AppError::user_with_hint(
-                    "administrator request cancelled",
-                    "re-run from an elevated PowerShell window when ready",
-                ));
-            }
-        }
-
-        eprintln!(
-            "  {}",
-            console::style("Requesting Administrator privileges...").dim()
-        );
-        relaunch_current_command_as_admin()?;
-        std::process::exit(0);
     }
 
     // ── Command dispatch ──────────────────────────────────────────────
@@ -1673,23 +1521,11 @@ impl App {
 
         let mgr = self.get_service_manager()?;
         mgr.install()?;
-        let delegated_control = self.configure_control_plane_access()?;
         if !self.renderer.is_json() {
             ui::print_ok("Service unit installed");
-            if matches!(self.platform.os_family, OsFamily::Linux)
-                && matches!(self.current_install_scope(), InstallScope::System)
-                && delegated_control.is_none()
-            {
-                ui::print_warn(
-                    "Installed without delegating future non-root control because no target user was detected",
-                );
-                ui::print_hint(
-                    "re-run from a normal user shell with sudo, or reinstall with `VALSB_DELEGATE_USER=<username>` to grant non-root service control",
-                );
-            }
         }
 
-        let manifest = self.build_manifest(Some(version.clone()), delegated_control);
+        let manifest = self.build_manifest(Some(version.clone()));
         install::save_manifest(&self.paths.manifest_file(), &manifest)?;
 
         if self.renderer.is_json() {
@@ -1970,8 +1806,7 @@ impl App {
         } else {
             install::load_manifest(&self.paths.manifest_file())?.and_then(|m| m.sing_box_version)
         };
-        let delegated_control = self.configure_control_plane_access()?;
-        let manifest = self.build_manifest(sb_ver, delegated_control);
+        let manifest = self.build_manifest(sb_ver);
         install::save_manifest(&self.paths.manifest_file(), &manifest)?;
 
         if self.renderer.is_json() {
@@ -2329,176 +2164,42 @@ impl App {
     }
 }
 
-fn system_manifest_exists(os_family: OsFamily) -> bool {
-    if matches!(os_family, OsFamily::Windows) {
-        return false;
-    }
-    AppPaths::resolve(os_family, true, None)
-        .manifest_file()
-        .exists()
-}
-
-fn should_defer_elevation_until_confirmation(command: &Commands, yes: bool) -> bool {
-    matches!(command, Commands::Uninstall) && !yes
-}
-
-#[cfg(not(windows))]
-fn unix_command_needs_admin(command: &Commands, delegated_control: bool) -> bool {
-    match command {
-        Commands::Install | Commands::Update | Commands::Uninstall => true,
-        Commands::Version | Commands::Completion { .. } | Commands::ServiceWorker { .. } => false,
-        _ => !delegated_control,
-    }
+/// True when the command needs to read or write system state.
+///
+/// The only commands that are safe to run as a regular user are the ones
+/// that do not touch the on-disk state, the binary install root, or the
+/// service manager. Everything else is re-launched under sudo / UAC so
+/// users never have to type `sudo` themselves.
+fn command_requires_root(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Version | Commands::Completion { .. } | Commands::ServiceWorker { .. }
+    )
 }
 
 #[cfg(not(windows))]
-fn unix_elevation_reasons(command: &Commands) -> (&'static str, &'static [&'static str]) {
-    match command {
-        Commands::Install => (
-            "System-wide installation detected.",
-            &[
-                "the active installation is managed from system paths under /var/lib and /etc",
-                "installing managed binaries and service units modifies system-owned files",
-            ],
-        ),
-        Commands::Update => (
-            "System-wide update detected.",
-            &[
-                "the active installation is managed from system paths under /var/lib and /etc",
-                "updating managed binaries may stop and restart the system service",
-            ],
-        ),
-        Commands::Uninstall => (
-            "System-wide uninstall detected.",
-            &[
-                "uninstall removes managed binaries, configuration, cache, and service files from system paths",
-                "service teardown and filesystem cleanup require root access",
-            ],
-        ),
-        _ => (
-            "System-wide installation detected.",
-            &[
-                "the active installation is managed from system paths under /var/lib and /etc",
-                "privileged service operations still run through the system service manager",
-            ],
-        ),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_unix_delegate_user(platform: &Platform) -> Option<String> {
-    if let Ok(user) = std::env::var("VALSB_DELEGATE_USER") {
-        let user = user.trim();
-        if !user.is_empty() {
-            return Some(user.to_string());
-        }
-    }
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        let user = user.trim();
-        if !user.is_empty() {
-            return Some(user.to_string());
-        }
-    }
-    if platform.username != "root" {
-        return Some(platform.username.clone());
-    }
-    None
-}
-
-#[cfg(not(windows))]
-fn relaunch_current_command_with_sudo() -> AppResult<()> {
+fn relaunch_with_sudo() -> AppResult<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let exe = std::env::current_exe()
         .map_err(|e| AppError::runtime(format!("failed to locate current executable: {e}")))?;
+    eprintln!(
+        "  {}",
+        console::style("valsb requires root; requesting sudo...").dim()
+    );
     let status = std::process::Command::new("sudo")
         .arg(exe)
         .args(args)
         .status()
-        .map_err(|e| AppError::runtime(format!("failed to request sudo: {e}")))?;
-    if !status.success() {
-        return Err(AppError::runtime_with_hint(
-            format!(
-                "sudo relaunch failed with exit code {}",
-                status.code().unwrap_or(1)
-            ),
-            "approve the sudo prompt or run the command manually with `sudo`",
-        ));
-    }
-    Ok(())
+        .map_err(|e| AppError::runtime(format!("failed to invoke sudo: {e}")))?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(windows)]
-fn windows_command_needs_admin(command: &Commands, delegated_control: bool) -> bool {
-    match command {
-        Commands::Install | Commands::Update | Commands::Uninstall => true,
-        Commands::Start | Commands::Stop | Commands::Restart | Commands::Reload => {
-            !delegated_control
-        }
-        _ => false,
-    }
-}
-
-#[cfg(windows)]
-fn windows_elevation_reasons(command: &Commands) -> (&'static str, &'static [&'static str]) {
-    match command {
-        Commands::Install => (
-            "Windows service installation detected.",
-            &[
-                "registering a Windows service requires access to the Service Control Manager",
-                "installing sing-box for service use may require elevated system changes",
-            ],
-        ),
-        Commands::Uninstall => (
-            "Windows service uninstall detected.",
-            &[
-                "removing the Windows service requires access to the Service Control Manager",
-                "cleanup may need to stop and delete service-managed resources",
-            ],
-        ),
-        Commands::Update => (
-            "Windows service update detected.",
-            &[
-                "updating a service-managed installation may need service stop/start access",
-                "replacing managed binaries should run with elevated permissions on Windows",
-            ],
-        ),
-        _ => (
-            "Windows service operation detected.",
-            &[
-                "starting or controlling the Windows service requires Administrator access",
-                "service operations are mediated through the Service Control Manager",
-            ],
-        ),
-    }
-}
-
-#[cfg(windows)]
-fn windows_is_elevated() -> AppResult<bool> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent()); if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { exit 0 } else { exit 1 }",
-        ])
-        .output()
-        .map_err(|e| AppError::runtime(format!("failed to detect Administrator privileges: {e}")))?;
-    Ok(output.status.success())
-}
-
-#[cfg(windows)]
-fn relaunch_current_command_as_admin() -> AppResult<()> {
+fn relaunch_as_admin() -> AppResult<()> {
     let exe = std::env::current_exe()
         .map_err(|e| AppError::runtime(format!("failed to locate current executable: {e}")))?;
     let cwd = std::env::current_dir()
         .map_err(|e| AppError::runtime(format!("failed to resolve working directory: {e}")))?;
-    let delegate_account =
-        current_windows_identity_value("[Security.Principal.WindowsIdentity]::GetCurrent().Name")?;
-    let delegate_sid = current_windows_identity_value(
-        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    )?;
 
     let host = std::env::var("SystemRoot")
         .map(std::path::PathBuf::from)
@@ -2507,26 +2208,23 @@ fn relaunch_current_command_as_admin() -> AppResult<()> {
 
     let escaped_exe = exe.to_string_lossy().replace('\'', "''");
     let escaped_cwd = cwd.to_string_lossy().replace('\'', "''");
-    let escaped_account = delegate_account.replace('\'', "''");
-    let escaped_sid = delegate_sid.replace('\'', "''");
 
     let mut command = String::from("$ErrorActionPreference = 'Stop'\r\n");
-    command.push_str(&format!("$exe = '{}'\r\n", escaped_exe));
-    command.push_str(&format!("$cwd = '{}'\r\n", escaped_cwd));
-    command.push_str(&format!(
-        "$env:VALSB_DELEGATE_ACCOUNT = '{}'\r\n",
-        escaped_account
-    ));
-    command.push_str(&format!("$env:VALSB_DELEGATE_SID = '{}'\r\n", escaped_sid));
+    command.push_str(&format!("$exe = '{escaped_exe}'\r\n"));
+    command.push_str(&format!("$cwd = '{escaped_cwd}'\r\n"));
     command.push_str("$argsList = @(\r\n");
     for arg in std::env::args().skip(1) {
         let escaped = arg.replace('\'', "''");
-        command.push_str(&format!("  '{}'\r\n", escaped));
+        command.push_str(&format!("  '{escaped}'\r\n"));
     }
     command.push_str(")\r\n");
     command.push_str("$proc = Start-Process -FilePath $exe -Verb RunAs -WorkingDirectory $cwd -ArgumentList $argsList -Wait -PassThru\r\n");
     command.push_str("exit $proc.ExitCode\r\n");
 
+    eprintln!(
+        "  {}",
+        console::style("valsb requires Administrator; requesting UAC prompt...").dim()
+    );
     let status = Command::new(host)
         .args([
             "-NoProfile",
@@ -2541,40 +2239,7 @@ fn relaunch_current_command_as_admin() -> AppResult<()> {
             AppError::runtime(format!("failed to request Administrator privileges: {e}"))
         })?;
 
-    if !status.success() {
-        return Err(AppError::runtime_with_hint(
-            format!(
-                "Administrator relaunch failed with exit code {}",
-                status.code().unwrap_or(1)
-            ),
-            "approve the UAC prompt or run the command from an elevated PowerShell window",
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(windows)]
-fn current_windows_identity_value(expression: &str) -> AppResult<String> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            expression,
-        ])
-        .output()
-        .map_err(|e| AppError::runtime(format!("failed to query Windows identity: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::runtime(format!(
-            "failed to query Windows identity: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 // ── Data types ────────────────────────────────────────────────────────
@@ -2994,28 +2659,20 @@ mod tests {
         assert_eq!(groups[1].current.as_deref(), Some("JP-1"));
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn unix_command_needs_admin_respects_delegated_control() {
-        assert!(unix_command_needs_admin(&Commands::Install, true));
-        assert!(!unix_command_needs_admin(&Commands::Status, true));
-        assert!(unix_command_needs_admin(&Commands::Status, false));
-        assert!(!unix_command_needs_admin(&Commands::Version, false));
+    fn version_and_completion_skip_root_elevation() {
+        assert!(!command_requires_root(&Commands::Version));
+        assert!(!command_requires_root(&Commands::Completion {
+            shell: clap_complete::Shell::Bash,
+        }));
     }
 
     #[test]
-    fn uninstall_defers_elevation_until_confirmation() {
-        assert!(should_defer_elevation_until_confirmation(
-            &Commands::Uninstall,
-            false
-        ));
-        assert!(!should_defer_elevation_until_confirmation(
-            &Commands::Uninstall,
-            true
-        ));
-        assert!(!should_defer_elevation_until_confirmation(
-            &Commands::Status,
-            false
-        ));
+    fn state_and_service_commands_require_root() {
+        assert!(command_requires_root(&Commands::Install));
+        assert!(command_requires_root(&Commands::Update));
+        assert!(command_requires_root(&Commands::Uninstall));
+        assert!(command_requires_root(&Commands::Status));
+        assert!(command_requires_root(&Commands::Start));
     }
 }

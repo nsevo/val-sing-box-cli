@@ -6,7 +6,7 @@ use super::{ServiceManager, ServiceStatus};
 
 const LABEL: &str = "com.valsb.sing-box";
 
-fn plist_content(sing_box_bin: &str, config_path: &str, log_dir: &str) -> String {
+fn plist_content(sing_box_bin: &str, config_path: &str, data_dir: &str, log_dir: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -18,6 +18,8 @@ fn plist_content(sing_box_bin: &str, config_path: &str, log_dir: &str) -> String
     <key>ProgramArguments</key>
     <array>
         <string>{sing_box_bin}</string>
+        <string>-D</string>
+        <string>{data_dir}</string>
         <string>-c</string>
         <string>{config_path}</string>
         <string>run</string>
@@ -58,143 +60,6 @@ fn parse_launchctl_list() -> AppResult<(bool, Option<u32>)> {
     Ok((true, pid))
 }
 
-pub struct LaunchdAgentManager {
-    plist_path: String,
-    config_path: String,
-    sing_box_bin: String,
-    data_dir: String,
-}
-
-impl LaunchdAgentManager {
-    pub fn new(plist_path: &str, config_path: &str, sing_box_bin: &str, data_dir: &str) -> Self {
-        Self {
-            plist_path: plist_path.to_string(),
-            config_path: config_path.to_string(),
-            sing_box_bin: sing_box_bin.to_string(),
-            data_dir: data_dir.to_string(),
-        }
-    }
-
-    fn log_dir(&self) -> String {
-        format!("{}/logs", self.data_dir)
-    }
-}
-
-impl ServiceManager for LaunchdAgentManager {
-    fn install(&self) -> AppResult<()> {
-        let log_dir = self.log_dir();
-        std::fs::create_dir_all(&log_dir)?;
-
-        let content = plist_content(&self.sing_box_bin, &self.config_path, &log_dir);
-        if let Some(parent) = std::path::Path::new(&self.plist_path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.plist_path, content)?;
-
-        let output = launchctl(&["load", &self.plist_path])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::runtime(format!(
-                "failed to load launch agent: {}",
-                stderr.trim()
-            )));
-        }
-        Ok(())
-    }
-
-    fn uninstall(&self) -> AppResult<()> {
-        let _ = self.stop();
-        let _ = launchctl(&["unload", &self.plist_path]);
-        let _ = std::fs::remove_file(&self.plist_path);
-        Ok(())
-    }
-
-    fn start(&self) -> AppResult<()> {
-        let output = launchctl(&["start", LABEL])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::runtime_with_hint(
-                format!("failed to start service: {}", stderr.trim()),
-                "run `valsb doctor` to check environment",
-            ));
-        }
-        Ok(())
-    }
-
-    fn stop(&self) -> AppResult<()> {
-        let output = launchctl(&["stop", LABEL])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(AppError::runtime(format!(
-                "failed to stop service: {}",
-                stderr.trim()
-            )));
-        }
-        Ok(())
-    }
-
-    fn restart(&self) -> AppResult<()> {
-        let _ = self.stop();
-        self.start()
-    }
-
-    fn reload(&self) -> AppResult<()> {
-        self.restart()
-    }
-
-    fn status(&self) -> AppResult<ServiceStatus> {
-        let (loaded, pid) = parse_launchctl_list()?;
-        Ok(ServiceStatus {
-            active: pid.is_some(),
-            state: if pid.is_some() {
-                "running".to_string()
-            } else if loaded {
-                "loaded (not running)".to_string()
-            } else {
-                "not loaded".to_string()
-            },
-            main_pid: pid,
-            unit_file: Some(self.plist_path.clone()),
-        })
-    }
-
-    fn logs(&self, follow: bool, lines: u32) -> AppResult<()> {
-        let log_path = format!("{}/sing-box.stderr.log", self.log_dir());
-        if !std::path::Path::new(&log_path).exists() {
-            println!("No log file found at {log_path}");
-            return Ok(());
-        }
-
-        if follow {
-            let status = Command::new("tail")
-                .args(["-f", "-n", &lines.to_string(), &log_path])
-                .status()
-                .map_err(|e| AppError::runtime(format!("failed to run tail: {e}")))?;
-            if !status.success() {
-                return Err(AppError::runtime("tail exited with an error"));
-            }
-        } else {
-            let status = Command::new("tail")
-                .args(["-n", &lines.to_string(), &log_path])
-                .status()
-                .map_err(|e| AppError::runtime(format!("failed to run tail: {e}")))?;
-            if !status.success() {
-                return Err(AppError::runtime("tail exited with an error"));
-            }
-        }
-        Ok(())
-    }
-
-    fn is_active(&self) -> AppResult<bool> {
-        let (_, pid) = parse_launchctl_list()?;
-        Ok(pid.is_some())
-    }
-
-    fn backend_name(&self) -> &'static str {
-        "launchd (user agent)"
-    }
-}
-
 pub struct LaunchdDaemonManager {
     plist_path: String,
     config_path: String,
@@ -222,7 +87,15 @@ impl ServiceManager for LaunchdDaemonManager {
         let log_dir = self.log_dir();
         std::fs::create_dir_all(&log_dir)?;
 
-        let content = plist_content(&self.sing_box_bin, &self.config_path, &log_dir);
+        let content = plist_content(
+            &self.sing_box_bin,
+            &self.config_path,
+            &self.data_dir,
+            &log_dir,
+        );
+        if let Some(parent) = std::path::Path::new(&self.plist_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&self.plist_path, content)?;
 
         let output = launchctl(&["load", &self.plist_path])?;
@@ -299,22 +172,18 @@ impl ServiceManager for LaunchdDaemonManager {
             return Ok(());
         }
 
+        let lines_str = lines.to_string();
+        let mut cmd = Command::new("tail");
         if follow {
-            let status = Command::new("tail")
-                .args(["-f", "-n", &lines.to_string(), &log_path])
-                .status()
-                .map_err(|e| AppError::runtime(format!("failed to run tail: {e}")))?;
-            if !status.success() {
-                return Err(AppError::runtime("tail exited with an error"));
-            }
+            cmd.args(["-f", "-n", &lines_str, &log_path]);
         } else {
-            let status = Command::new("tail")
-                .args(["-n", &lines.to_string(), &log_path])
-                .status()
-                .map_err(|e| AppError::runtime(format!("failed to run tail: {e}")))?;
-            if !status.success() {
-                return Err(AppError::runtime("tail exited with an error"));
-            }
+            cmd.args(["-n", &lines_str, &log_path]);
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| AppError::runtime(format!("failed to run tail: {e}")))?;
+        if !status.success() {
+            return Err(AppError::runtime("tail exited with an error"));
         }
         Ok(())
     }
@@ -325,6 +194,6 @@ impl ServiceManager for LaunchdDaemonManager {
     }
 
     fn backend_name(&self) -> &'static str {
-        "launchd (system daemon)"
+        "launchd"
     }
 }

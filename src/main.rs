@@ -50,26 +50,7 @@ async fn main() {
         }
     };
 
-    #[cfg(not(windows))]
-    if let Err(e) = app.maybe_elevate_unix_command(&cli.command) {
-        if app.renderer.is_json() {
-            app.renderer.print_json(&JsonOutput::<()>::error(
-                "elevation",
-                e.error_code(),
-                e.to_string(),
-                e.hint().map(str::to_string),
-            ));
-        } else {
-            ui::print_fail(&e.to_string());
-            if let Some(hint) = e.hint() {
-                ui::print_hint(&format!("run: {hint}"));
-            }
-        }
-        std::process::exit(e.exit_code());
-    }
-
-    #[cfg(windows)]
-    if let Err(e) = app.maybe_elevate_windows_command(&cli.command) {
+    if let Err(e) = app.maybe_elevate(&cli.command) {
         if app.renderer.is_json() {
             app.renderer.print_json(&JsonOutput::<()>::error(
                 "elevation",

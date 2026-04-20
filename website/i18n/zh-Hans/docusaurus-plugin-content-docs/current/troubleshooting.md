@@ -71,15 +71,9 @@ valsb start
    valsb sub update
    ```
 
-### TUN 模式需要 root 权限
+### Root 权限
 
-在 Linux 上，TUN 模式需要以 root 身份运行：
-
-```bash
-sudo valsb start
-```
-
-在 Windows 上，以管理员身份运行 PowerShell。
+`valsb` 是一个 root 专用工具。普通用户运行任意需要写入系统状态或操作服务的命令时，会自动以 `sudo`（Linux/macOS）或 UAC 提示（Windows）重新启动自身，因此你通常不需要手动加 `sudo`。如果想跳过提示，可以直接在 root shell 中运行，或先执行 `sudo -v` 提前授权。
 
 ## 获取帮助
 

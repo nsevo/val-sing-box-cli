@@ -96,6 +96,20 @@ impl DoctorReport {
             path: sb_path.clone(),
         };
 
+        checks.push(Check {
+            name: "root".into(),
+            status: if platform.is_root {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warning
+            },
+            message: if platform.is_root {
+                "running as root".into()
+            } else {
+                "not running as root; valsb will request elevation when needed".into()
+            },
+        });
+
         if sing_box.installed {
             checks.push(Check {
                 name: "sing-box".into(),

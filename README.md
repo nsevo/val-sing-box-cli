@@ -8,13 +8,17 @@ sing-box is a proxy kernel. The operations around it are simple: install, load a
 
 ## Install
 
+`valsb` is a root-managed CLI: TUN mode and the system service both require
+elevated privileges, so the installer needs root and the binary will request
+sudo / UAC automatically when you invoke commands as a normal user.
+
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nsevo/val-sing-box-cli/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nsevo/val-sing-box-cli/main/scripts/install.sh | sudo bash
 ```
 
-### Windows (PowerShell)
+### Windows (PowerShell, Administrator)
 
 ```powershell
 irm https://raw.githubusercontent.com/nsevo/val-sing-box-cli/main/scripts/install.ps1 | iex
@@ -46,7 +50,7 @@ valsb node use
 
 | OS | Arch | Service Backend |
 |---|---|---|
-| Linux | amd64, arm64 | systemd (user / system) |
+| Linux | amd64, arm64 | systemd (system) |
 | OpenWrt | amd64, arm64 | procd |
 | macOS | amd64, arm64 | launchd |
 | Windows | amd64 | Windows Service |

@@ -1,9 +1,11 @@
 mod manifest;
 
-pub use manifest::{DelegatedControl, InstallScope, ManagedPaths, Manifest};
+pub use manifest::{ManagedPaths, Manifest};
 use std::path::Path;
 
 use crate::errors::{AppError, AppResult};
+
+const MAX_MANIFEST_SCHEMA: u32 = 3;
 
 pub fn load_manifest(path: &Path) -> AppResult<Option<Manifest>> {
     if !path.exists() {
@@ -13,10 +15,10 @@ pub fn load_manifest(path: &Path) -> AppResult<Option<Manifest>> {
     let content = std::fs::read_to_string(path)?;
     let manifest: Manifest = serde_json::from_str(&content)?;
 
-    if manifest.schema_version > 2 {
+    if manifest.schema_version > MAX_MANIFEST_SCHEMA {
         return Err(AppError::data_with_hint(
             format!(
-                "manifest uses schema version {}, but this version only supports up to 2",
+                "manifest uses schema version {}, but this version only supports up to {MAX_MANIFEST_SCHEMA}",
                 manifest.schema_version
             ),
             "upgrade valsb to a newer version",

@@ -1,7 +1,6 @@
 use std::process::Command;
 
 use crate::errors::{AppError, AppResult};
-use crate::install::DelegatedControl;
 
 use super::{ServiceManager, ServiceStatus};
 
@@ -89,105 +88,6 @@ fn sc_create_args(bin_path: &str) -> Vec<String> {
         "start=".to_string(),
         "auto".to_string(),
     ]
-}
-
-pub fn configure_service_delegate() -> AppResult<DelegatedControl> {
-    let principal = delegated_windows_account_name()?;
-    let sid = delegated_windows_sid()?;
-    let output = sc(&["sdshow", SERVICE_NAME])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::runtime(format!(
-            "failed to read service security descriptor: {}",
-            stderr.trim()
-        )));
-    }
-
-    let current = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if current.contains(&sid) {
-        return Ok(DelegatedControl {
-            mode: "windows_service_acl".to_string(),
-            principal: Some(principal),
-            group: None,
-        });
-    }
-
-    let ace = format!("(A;;RPWPLOLC;;;{sid})");
-    let updated = append_service_ace(&current, &ace)?;
-    let output = sc(&["sdset", SERVICE_NAME, &updated])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(AppError::runtime(format!(
-            "failed to delegate service control permissions: {} {}",
-            stdout.trim(),
-            stderr.trim()
-        )));
-    }
-
-    Ok(DelegatedControl {
-        mode: "windows_service_acl".to_string(),
-        principal: Some(principal),
-        group: None,
-    })
-}
-
-fn append_service_ace(sddl: &str, ace: &str) -> AppResult<String> {
-    let dacl_start = sddl
-        .find("D:")
-        .ok_or_else(|| AppError::runtime("service security descriptor does not contain a DACL"))?;
-
-    if let Some(relative_sacl) = sddl[dacl_start + 2..].find("S:") {
-        let sacl_start = dacl_start + 2 + relative_sacl;
-        Ok(format!(
-            "{}{}{}",
-            &sddl[..sacl_start],
-            ace,
-            &sddl[sacl_start..]
-        ))
-    } else {
-        Ok(format!("{sddl}{ace}"))
-    }
-}
-
-fn delegated_windows_account_name() -> AppResult<String> {
-    if let Ok(value) = std::env::var("VALSB_DELEGATE_ACCOUNT") {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
-    powershell_identity_value("[Security.Principal.WindowsIdentity]::GetCurrent().Name")
-}
-
-fn delegated_windows_sid() -> AppResult<String> {
-    if let Ok(value) = std::env::var("VALSB_DELEGATE_SID") {
-        if !value.trim().is_empty() {
-            return Ok(value);
-        }
-    }
-    powershell_identity_value("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value")
-}
-
-fn powershell_identity_value(expression: &str) -> AppResult<String> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            expression,
-        ])
-        .output()
-        .map_err(|e| AppError::runtime(format!("failed to query Windows identity: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::runtime(format!(
-            "failed to query Windows identity: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 impl ServiceManager for WindowsServiceManager {
@@ -328,25 +228,6 @@ mod tests {
         assert_eq!(args[5], DISPLAY_NAME);
         assert_eq!(args[6], "start=");
         assert_eq!(args[7], "auto");
-    }
-
-    #[test]
-    fn append_service_ace_inserts_before_sacl() {
-        let sddl = "D:(A;;CC;;;SY)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)";
-        let ace = "(A;;RPWPLOLC;;;S-1-5-21-1)";
-        let updated = append_service_ace(sddl, ace).unwrap();
-        assert_eq!(
-            updated,
-            "D:(A;;CC;;;SY)(A;;RPWPLOLC;;;S-1-5-21-1)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
-        );
-    }
-
-    #[test]
-    fn append_service_ace_appends_when_no_sacl_exists() {
-        let sddl = "D:(A;;CC;;;SY)";
-        let ace = "(A;;RPWPLOLC;;;S-1-5-21-1)";
-        let updated = append_service_ace(sddl, ace).unwrap();
-        assert_eq!(updated, "D:(A;;CC;;;SY)(A;;RPWPLOLC;;;S-1-5-21-1)");
     }
 }
 

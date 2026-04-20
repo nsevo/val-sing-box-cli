@@ -4,6 +4,13 @@ use super::detect::OsFamily;
 
 const APP_NAME: &str = "val-sing-box-cli";
 
+/// Filesystem layout for valsb.
+///
+/// valsb is a root-only tool: every install lives under well-known system
+/// paths so that there is exactly one source of truth on each machine. The
+/// only exception is `--config-dir <path>`, which redirects state into a
+/// custom base directory (used by tests and by anyone who wants to inspect
+/// state without root).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -15,57 +22,26 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
-    pub fn resolve(os_family: OsFamily, is_root: bool, override_config_dir: Option<&str>) -> Self {
-        if let Some(dir) = override_config_dir {
-            let base = PathBuf::from(dir);
-            return Self::from_custom_base(base, os_family, is_root);
+    /// Resolve the canonical layout for the host OS, optionally rooted at a
+    /// caller-provided base directory (for `--config-dir` overrides).
+    pub fn resolve(os_family: OsFamily, override_config_dir: Option<&str>) -> Self {
+        let defaults = Self::system(os_family);
+        match override_config_dir {
+            Some(dir) => Self::from_custom_base(PathBuf::from(dir), defaults),
+            None => defaults,
         }
+    }
 
+    fn system(os_family: OsFamily) -> Self {
         match os_family {
+            OsFamily::Linux => Self::linux(),
+            OsFamily::MacOS => Self::macos(),
             OsFamily::OpenWrt => Self::openwrt(),
-            OsFamily::Linux if is_root => Self::unix_root(),
-            OsFamily::MacOS if is_root => Self::macos_root(),
-            OsFamily::Linux | OsFamily::MacOS | OsFamily::Windows => Self::user_dirs(os_family),
+            OsFamily::Windows => Self::windows(),
         }
     }
 
-    /// User-level paths. Works on Linux, macOS, and Windows via the `dirs` crate
-    /// which resolves to platform-native directories automatically.
-    fn user_dirs(os_family: OsFamily) -> Self {
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| home().join(".config"))
-            .join(APP_NAME);
-        let (cache_dir, data_dir, bin_dir, sing_box_bin_dir) =
-            if matches!(os_family, OsFamily::Windows) {
-                let data_dir = config_dir.clone();
-                let bin_dir = data_dir.join("bin");
-                let cache_dir = data_dir.join("cache");
-                let sing_box_bin_dir = bin_dir.clone();
-                (cache_dir, data_dir, bin_dir, sing_box_bin_dir)
-            } else {
-                let cache_dir = dirs::cache_dir()
-                    .unwrap_or_else(|| home().join(".cache"))
-                    .join(APP_NAME);
-                let data_dir = dirs::data_dir()
-                    .unwrap_or_else(|| home().join(".local/share"))
-                    .join(APP_NAME);
-                let bin_dir = home().join(".local/bin");
-                let sing_box_bin_dir = data_dir.join("bin");
-                (cache_dir, data_dir, bin_dir, sing_box_bin_dir)
-            };
-        let unit_file = resolve_user_unit_file(os_family);
-
-        Self {
-            config_dir,
-            cache_dir,
-            data_dir,
-            bin_dir,
-            sing_box_bin_dir,
-            unit_file,
-        }
-    }
-
-    fn unix_root() -> Self {
+    fn linux() -> Self {
         Self {
             config_dir: PathBuf::from("/etc").join(APP_NAME),
             cache_dir: PathBuf::from("/var/cache").join(APP_NAME),
@@ -76,7 +52,7 @@ impl AppPaths {
         }
     }
 
-    fn macos_root() -> Self {
+    fn macos() -> Self {
         Self {
             config_dir: PathBuf::from("/etc").join(APP_NAME),
             cache_dir: PathBuf::from("/var/cache").join(APP_NAME),
@@ -98,19 +74,32 @@ impl AppPaths {
         }
     }
 
-    fn from_custom_base(base: PathBuf, os_family: OsFamily, is_root: bool) -> Self {
-        let defaults = match os_family {
-            OsFamily::OpenWrt => Self::openwrt(),
-            OsFamily::Linux if is_root => Self::unix_root(),
-            OsFamily::MacOS if is_root => Self::macos_root(),
-            OsFamily::Linux | OsFamily::MacOS | OsFamily::Windows => Self::user_dirs(os_family),
-        };
+    fn windows() -> Self {
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let program_files = std::env::var_os("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+        let base = program_data.join(APP_NAME);
+        let bin_dir = program_files.join(APP_NAME);
+        Self {
+            cache_dir: base.join("cache"),
+            data_dir: base.clone(),
+            bin_dir: bin_dir.clone(),
+            sing_box_bin_dir: bin_dir,
+            config_dir: base,
+            unit_file: PathBuf::new(),
+        }
+    }
+
+    fn from_custom_base(base: PathBuf, defaults: Self) -> Self {
         let data_dir = base.join("data");
         let sing_box_bin_dir = data_dir.join("bin");
         Self {
             config_dir: base.clone(),
-            data_dir,
             cache_dir: base.join("cache"),
+            data_dir,
             sing_box_bin_dir,
             ..defaults
         }
@@ -151,22 +140,7 @@ impl AppPaths {
         ] {
             std::fs::create_dir_all(dir)?;
         }
-        let sub_cache = self.subscription_cache_dir();
-        std::fs::create_dir_all(&sub_cache)?;
+        std::fs::create_dir_all(self.subscription_cache_dir())?;
         Ok(())
     }
-}
-
-fn resolve_user_unit_file(os_family: OsFamily) -> PathBuf {
-    match os_family {
-        OsFamily::MacOS => home().join("Library/LaunchAgents/com.valsb.sing-box.plist"),
-        OsFamily::Windows => PathBuf::new(),
-        _ => dirs::config_dir()
-            .unwrap_or_else(|| home().join(".config"))
-            .join("systemd/user/valsb-sing-box.service"),
-    }
-}
-
-fn home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }
